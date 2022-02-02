@@ -11,7 +11,8 @@ use serenity::model::{
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::time;
 
 /// Where the discord api key should be stored in the process or .env environment
 /// variables
@@ -20,8 +21,17 @@ const SECRET_KEY: &str = "DISCORD_SECRET";
 /// Role name identifying users with the ability to start and stop elections.
 const BOT_ROLE: &str = "voting";
 
+/// The channel where the bot should post announcements
+const BOT_CHANNEL: &str = "announcements";
+
+/// The number of winners that should be displayed for convenience purposes
+const CONVENIENT_WINNERS: usize = 5;
+
 /// Everyone starts out with 100 points, and they reset on the below interval:
 const STARTING_POINTS: usize = 100;
+
+/// The number of hours that people can suggest ideas for
+const SUGG_INTERVAL: usize = 48;
 
 /// The number of hours that a vote should last
 const VOTE_INTERVAL: usize = 24;
@@ -43,6 +53,24 @@ const START_CMD: &str = "start";
 
 /// The name of the command used to stop the current voting step
 const STOP_CMD: &str = "stop";
+
+// Make an announcement, granted that the user is a user with those privileges
+macro_rules! announce {
+    ($msg:ident,$cts:expr) => {
+        if let Some(ann) = msg
+            .guild()
+            .await
+            .map(|g| g.channel_id_from_name(BOT_CHANNEL))
+            .await
+        {
+            ann.say().await;
+        } else {
+            msg.author
+                .dm(|m| m.content("Failed to start election: guild could not be found!"))
+                .await;
+        }
+    };
+}
 
 // Prevents a user from performing this action
 macro_rules! role_gate {
@@ -68,7 +96,7 @@ macro_rules! role_gate {
 /// !prop <topic>: Adds a topic to the upcoming election
 /// !vote <n>, <topic>: Cast n votes for the selected topic
 /// !points: Get the sender's remaining points in the election
-/// !start: Starts a new vote (can only be called by users with `vote` role)
+/// !start <prompt>: Starts a new vote (can only be called by users with `vote` role)
 /// !stop: Stops the segment of the voting process (can only be called by users with `vote` role)
 struct Handler {
     // Suggested topics for the upcoming election
@@ -79,7 +107,10 @@ struct Handler {
     points: HashMap<GuildId, HashMap<UserId, AtomicUsize>>,
 
     // Total votes per idea, and votes cast per idea per user
-    votes: HashMap<GuildId, HashMap<String, (AtomicUsize, HashMap<UserId, AtomicUsize>)>>,
+    votes: HashMap<
+        GuildId,
+        RwLock<HashMap<usize, (String, AtomicUsize, HashMap<UserId, AtomicUsize>)>>,
+    >,
 }
 
 /// Votes can be stopped by terminating the current step and continuing to the
@@ -114,13 +145,44 @@ impl EventHandler for Handler {
     }
 
     /// !prop <topic>: Adds a topic to the upcoming election
-    async fn prop(&self, context: Context, msg: Message, args: String) {}
+    async fn prop(&self, context: Context, msg: Message, args: String) {
+        if let Some(g) = msg.guild().await {
+            if self.upcoming_topics.get(g).read().contains(msg.contents) {
+                // Alert the user if their proposal already exists
+                msg.author
+                    .dm(|m| {
+                        m.content(format!(
+                            "Your proposal {} already exists! Not adding.",
+                            msg.contents
+                        ))
+                    })
+                    .await;
+            }
+
+            // Register the new candidate
+            self.upcoming_topics.get(g).write().add(msg.contents);
+            announce!(msg, format!("New candidate proposed: {}", msg.contents));
+        }
+    }
 
     /// !vote <n>, <topic>: Cast n votes for the selected topic
     async fn vote(&self, context: Context, msg: Message, args: String) {}
 
     /// !points: Get the sender's remaining points in the election
-    async fn points(&self, context: Context, msg: Message, args: String) {}
+    async fn points(&self, context: Context, msg: Message, args: String) {
+        if let Some(g) = msg.guild().await {
+            // Send the user the number of points they have left
+            msg.author
+                .dm(|m| {
+                    m.content(format!(
+                        "You have {} points left (out of {}) to spend in this election.",
+                        self.points.get(g).get(msg.author.id),
+                        STARTING_POINTS,
+                    ))
+                })
+                .await;
+        }
+    }
 
     /// !start: Starts an election
     async fn start(&self, context: Context, msg: Message, args: String) {
@@ -129,12 +191,109 @@ impl EventHandler for Handler {
         // Stop any currently ongoing election
         self.stop(context, msg, args, StopKind::HARD).await;
 
-        // Stop the election after the voting interval
+        // Announce the vote
+        announce!(msg, format("@everyone An election has started: {}\nSuggest candidates with !prop <idea>\nTime remaining: {}h", msg.contents, VOTE_INTERVAL));
+
+        // Stop the suggestion election after the voting interval
+        // Count up the suggestions
+        time::sleep(Duration::from_secs(SUGG_INTERVAL * 60 * 60)).await;
+
+        // If the user hasn't already cleared the suggestions, do it automatically
+        if self.in_suggestion_period(msg) {
+            self.stop(context, msg, args, StopKind::SOFT).await;
+        }
     }
 
     /// !stop: Stops the currently running step of the election
-    async fn stop(&self, context: Context, msg: Message, args: String, kind: ) {
+    async fn stop(&self, context: Context, msg: Message, args: String, kind: StopKind) {
         role_gate!(msg, "stop an election");
+
+        // Clear out the proposals and list them in an announcement
+        if self.in_suggestion_period(msg).await {
+            if let Some(g) = msg.guild().await {
+                // Display the candidates with their indices
+                let candidates_str = self
+                    .upcoming_topics
+                    .get(g)
+                    .read()
+                    .iter()
+                    .enumerate()
+                    .fold(String::new(), |i, a, b| a + format!("#{}: {}\n", i + 1, b));
+
+                // Clear out all candidates and set their vote counts to zero
+                for (i, name) in self.upcoming_topics.get(g).read().keys().enumerate() {
+                    self.votes
+                        .get(g)
+                        .write()
+                        .insert(name, i, (0, HashMap::new()));
+                }
+
+                // Remove all candidates
+                self.upcoming_topics.get(g).write().clear();
+
+                announce!(msg, format!("@everyone Candidates have been selected:\n{}\nVote with !vote <n votes>, <candidate number>", candidates_str));
+
+                // Allow user to cast votes, and then automatically stop the count after the
+                // interval
+                time::sleep(Duration::from_secs(VOTE_INTERVAL * 60 * 60)).await;
+                if self.in_vote_period(msg).await {
+                    self.stop(context, msg, args, kind);
+                }
+            }
+        // Calculate the results of the election
+        } else if self.in_vote_period(msg).await {
+            if let Some(g) = msg.guild().await {
+                // Sort the candidates by their number of vote
+                let winners = self
+                    .votes
+                    .get(g)
+                    .read()
+                    .values()
+                    .collect::<Vec<(String, AtomicUsize, HashMap<UserId, AtomicUsize>)>>()
+                    .sort_by(|b, a| a.1 .1.partial_cmp(b.1 .1).unwrap());
+
+                // Display the first n winning candidates, their names, and their votes
+                let winners_str = winners
+                    .enumerate()
+                    .map(|i, w| format!("#{} {}: {}\n", i, w.0, w.1))
+                    .take(CONVENIENT_WINNERS)
+                    .join("\n");
+
+                announce!(
+                    msg,
+                    format!(
+                        "@everyone The election is over. The winners are:\n{}",
+                        winners_str
+                    )
+                );
+
+                // Clear the votes
+                self.votes.get(g).write().clear();
+
+                // Reset point counts
+                for k in self.points.get(g).keys() {
+                    self.points
+                        .get(g)
+                        .get(k)
+                        .swap(STARTING_POINTS, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Checks whether the vote is currently in the suggestion period.
+    async fn in_suggestion_period(&self, msg: Message) -> bool {
+        msg.guild_id
+            .map(|g| !self.upcoming_topics.get(g).read().is_empty())
+            .unwrap_or_default()
+    }
+
+    /// Checks whether the vote is currently in the suggestion period.
+    /// If no votes are cast, it is not in the voting period.
+    async fn in_vote_period(&self, msg: Message) -> bool {
+        msg.guild_id
+            .map(|g| !self.votes.get(g).is_empty())
+            .unwrap_or_default()
     }
 }
 

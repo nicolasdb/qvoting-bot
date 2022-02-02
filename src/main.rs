@@ -7,6 +7,7 @@ use serenity::framework::standard::{
 };
 use serenity::model::{
     channel::Message,
+    guild::Guild,
     id::{GuildId, UserId},
 };
 use std::collections::{HashMap, HashSet};
@@ -63,11 +64,13 @@ macro_rules! announce {
             .map(|g| g.channel_id_from_name(BOT_CHANNEL))
             .await
         {
-            ann.say().await;
+            ann.say().await
         } else {
             msg.author
                 .dm(|m| m.content("Failed to start election: guild could not be found!"))
                 .await;
+
+            None
         }
     };
 }
@@ -105,6 +108,9 @@ struct Handler {
     // Users cannot have less than 0 points, but they may have different
     // balances per-guild
     points: HashMap<GuildId, HashMap<UserId, AtomicUsize>>,
+
+    // The bot automatically updates results of the election as it progresses
+    results: HashMap<GuildId, Cell<Option<Message>>>,
 
     // Total votes per idea, and votes cast per idea per user
     votes: HashMap<
@@ -146,6 +152,14 @@ impl EventHandler for Handler {
 
     /// !prop <topic>: Adds a topic to the upcoming election
     async fn prop(&self, context: Context, msg: Message, args: String) {
+        // Users cannot propose while voting
+        if self.in_vote_period(msg).await {
+            msg.author
+                .dm(|m| m.content("Candidates cannot be proposed while the vote is ongoing!"));
+
+            return;
+        }
+
         if let Some(g) = msg.guild().await {
             if self.upcoming_topics.get(g).read().contains(msg.contents) {
                 // Alert the user if their proposal already exists
@@ -166,7 +180,58 @@ impl EventHandler for Handler {
     }
 
     /// !vote <n>, <topic>: Cast n votes for the selected topic
-    async fn vote(&self, context: Context, msg: Message, args: String) {}
+    async fn vote(&self, context: Context, msg: Message, args: String) {
+        // Extract the n and topic ID from the arguments
+        if let Some((n, candidate_id)) = args.split().map(|s| s.parse()) {
+            if let Some(g) = msg.guild().await {
+                // Reference to an atomic uint storing the user's vote count for the candidate
+                let candidate_votes = self.votes.get(g).read().get(candidate_id);
+
+                // The user will be refunded the points they've already spent on this candidate.
+                // Calculate conversions from votes to points accordingly
+                let can_spend = self.points.get(g).get(msg.author).load(Ordering::Relaxed)
+                    + candidate_votes
+                        .2
+                        .get(msg.author.id)
+                        .load(Ordering::Relaxed)
+                        .pow(2);
+                let req_points = n.pow(2);
+
+                // The user cannot continue if they lack the requisite points
+                if can_spend < req_points {
+                    msg.author.dm(|m| m.content(format!("Insufficient points to cast votes: {} votes cost {} points, but you can only spend {}.", n, req_points, can_spend))).await;
+
+                    return;
+                }
+
+                // Refund the user's votes previously delegated to the candidate
+                let prev_votes = candidate_votes
+                    .2
+                    .get(msg.author.id)
+                    .swap(n, Ordering::Relaxed);
+
+                // Remove old votes for the candidate, and calculate the new count
+                candidate_votes.1.fetch_sub(prev_votes, Ordering::Relaxed);
+                candidate_votes.1.fetch_add(n, Ordering::Relaxed);
+
+                // Refund the user's votes for the selected topic
+                self.points
+                    .get(g)
+                    .get(msg.author)
+                    .fetch_add(prev_votes, Ordering::Relaxed);
+                self.points
+                    .get(g)
+                    .get(msg.author)
+                    .fetch_sub(n, Ordering::Relaxed);
+
+                // Recalculate the vote balance announcement
+            }
+        } else {
+            msg.author
+                .dm(|m| m.content("Missing parameters. Usage: ```\n!vote <n>, <topic id>\n```"))
+                .await;
+        }
+    }
 
     /// !points: Get the sender's remaining points in the election
     async fn points(&self, context: Context, msg: Message, args: String) {
@@ -231,7 +296,9 @@ impl EventHandler for Handler {
                 // Remove all candidates
                 self.upcoming_topics.get(g).write().clear();
 
-                announce!(msg, format!("@everyone Candidates have been selected:\n{}\nVote with !vote <n votes>, <candidate number>", candidates_str));
+                // Store the announcement message for later reporting
+                let live_results = announce!(msg, format!("@everyone Candidates have been selected:\n{}\nVote with !vote <n votes>, <candidate number>", candidates_str));
+                self.results.get(g).replace(live_results);
 
                 // Allow user to cast votes, and then automatically stop the count after the
                 // interval
@@ -279,6 +346,15 @@ impl EventHandler for Handler {
                 }
             }
         }
+    }
+
+    /// Updates the most recent poll announcement in the given guild with the latest polling
+    /// numbers.
+    async fn poll_votes(&self, g: Guild) {
+        // TODO: Implement live reporting
+
+        // If no channel exists, the announcement cannot be updated
+        if let Some(chann) = g.channel_id_from_name(BOT_CHANNEL).await {}
     }
 
     /// Checks whether the vote is currently in the suggestion period.

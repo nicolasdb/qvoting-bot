@@ -1,13 +1,12 @@
 #[macro_use]
 extern crate const_format;
 
+#[macro_use]
+extern crate async_recursion;
+
 use dotenv::dotenv;
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
-use serenity::framework::standard::{
-    macros::{command, group},
-    CommandResult, StandardFramework,
-};
 use serenity::model::{
     channel::Message,
     id::{GuildId, UserId},
@@ -17,9 +16,10 @@ use std::env;
 use std::num::ParseIntError;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, RwLock,
+    Arc,
 };
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio::time;
 
 /// Where the discord api key should be stored in the process or .env environment
@@ -80,7 +80,8 @@ macro_rules! announce {
                 .dm($context, |m| {
                     m.content(format!("Failed to {}: guild could not be found!", $cts))
                 })
-                .await;
+                .await
+                .expect("discord API error");
 
             None
         }
@@ -98,12 +99,15 @@ macro_rules! role_gate {
                 .await
                 .unwrap_or_default()
             {
-                $msg.author.dm($context, |m| {
-                    m.content(format!(
-                        "You must have the {} role to {}!",
-                        BOT_ROLE, $action
-                    ))
-                });
+                $msg.author
+                    .dm($context, |m| {
+                        m.content(format!(
+                            "You must have the {} role to {}!",
+                            BOT_ROLE, $action
+                        ))
+                    })
+                    .await
+                    .expect("discord API error");
             }
         }
     };
@@ -134,16 +138,6 @@ struct Handler {
     >,
 }
 
-/// Votes can be stopped by terminating the current step and continuing to the
-/// next, or by terminating the vote altogether.
-enum StopKind {
-    /// Forcibly continue to the next step of the vote
-    SOFT,
-
-    /// Stop the vote entirely
-    HARD,
-}
-
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, context: Context, msg: Message) {
@@ -153,7 +147,9 @@ impl EventHandler for Handler {
         }
 
         // The first argument should be the name of the command
-        let (cmd, sargs) = msg.content.split_once(' ').unwrap();
+        let (cmd, sargs) = msg.content[1..]
+            .split_once(' ')
+            .unwrap_or((&msg.content[1..], ""));
 
         // Arguments must be manipulated later
         let args = sargs.to_owned();
@@ -165,6 +161,7 @@ impl EventHandler for Handler {
             POINTS_CMD => self.points(context, &msg, args).await,
             START_CMD => self.start(context, &msg, args).await,
             STOP_CMD => self.stop(&context, &msg).await,
+            _ => (),
         }
     }
 }
@@ -186,9 +183,12 @@ impl Handler {
     async fn prop(&self, context: Context, msg: &Message, args: String) {
         // Users cannot propose while voting
         if self.in_vote_period(msg).await {
-            msg.author.dm(&context, |m| {
-                m.content("Candidates cannot be proposed while the vote is ongoing!")
-            });
+            msg.author
+                .dm(&context, |m| {
+                    m.content("Candidates cannot be proposed while the vote is ongoing!")
+                })
+                .await
+                .expect("discord API error");
 
             return;
         }
@@ -199,18 +199,19 @@ impl Handler {
                 .get(&g.id)
                 .unwrap()
                 .read()
-                .unwrap()
-                .contains(msg.content.as_str())
+                .await
+                .contains(args.as_str())
             {
                 // Alert the user if their proposal already exists
                 msg.author
                     .dm(&context, |m| {
                         m.content(format!(
                             "Your proposal {} already exists! Not adding.",
-                            msg.content
+                            args
                         ))
                     })
-                    .await;
+                    .await
+                    .expect("discord API error");
             }
 
             // Register the new candidate
@@ -218,13 +219,10 @@ impl Handler {
                 .get(&g.id)
                 .unwrap()
                 .write()
-                .unwrap()
-                .insert(msg.content.clone());
-            announce!(
-                &context,
-                msg,
-                format!("New candidate proposed: {}", msg.content)
-            );
+                .await
+                .insert(args.trim_end().to_owned());
+            self.poll_suggestions(&context, &g.id).await;
+            announce!(&context, msg, format!("New candidate proposed: {}", args));
         }
     }
 
@@ -242,13 +240,8 @@ impl Handler {
                 let g = &guild.id;
 
                 // Reference to an atomic uint storing the user's vote count for the candidate
-                if let Some(candidate_votes) = self
-                    .votes
-                    .get(g)
-                    .unwrap()
-                    .read()
-                    .unwrap()
-                    .get(&candidate_id)
+                if let Some(candidate_votes) =
+                    self.votes.get(g).unwrap().read().await.get(&candidate_id)
                 {
                     // Each user starts with STARTING_POINTS points
                     if !self
@@ -256,14 +249,14 @@ impl Handler {
                         .get(g)
                         .unwrap()
                         .read()
-                        .unwrap()
+                        .await
                         .contains_key(&msg.author.id)
                     {
                         self.points
                             .get(g)
                             .unwrap()
                             .write()
-                            .unwrap()
+                            .await
                             .insert(msg.author.id, AtomicUsize::new(STARTING_POINTS));
                     }
 
@@ -275,7 +268,7 @@ impl Handler {
                             .get(g)
                             .unwrap()
                             .read()
-                            .unwrap()
+                            .await
                             .get(&msg.author.id)
                             .unwrap()
                             .load(Ordering::Relaxed)
@@ -284,7 +277,7 @@ impl Handler {
 
                         // The user cannot continue if they lack the requisite points
                         if can_spend < req_points {
-                            msg.author.dm(&context, |m| m.content(format!("Insufficient points to cast votes: {} votes cost {} points, but you can only spend {}.", n, req_points, can_spend))).await;
+                            msg.author.dm(&context, |m| m.content(format!("Insufficient points to cast votes: {} votes cost {} points, but you can only spend {}.", n, req_points, can_spend))).await.expect("discord API error");
 
                             return;
                         }
@@ -304,7 +297,7 @@ impl Handler {
                             .get(g)
                             .unwrap()
                             .read()
-                            .unwrap()
+                            .await
                             .get(&msg.author.id)
                             .unwrap()
                             .fetch_add(prev_votes, Ordering::Relaxed);
@@ -316,7 +309,7 @@ impl Handler {
                         .get(g)
                         .unwrap()
                         .read()
-                        .unwrap()
+                        .await
                         .get(&msg.author.id)
                         .unwrap()
                         .fetch_sub(n, Ordering::Relaxed);
@@ -330,30 +323,33 @@ impl Handler {
                 .dm(&context, |m| {
                     m.content("Missing parameters. Usage: ```\n!vote <n>, <topic id>\n```")
                 })
-                .await;
+                .await
+                .expect("discord API error");
         }
     }
 
     /// !points: Get the sender's remaining points in the election
-    async fn points(&self, context: Context, msg: &Message, args: String) {
+    async fn points(&self, context: Context, msg: &Message, _args: String) {
         if let Some(g) = msg.guild(&context).await {
+            let points_left = self
+                .points
+                .get(&g.id)
+                .unwrap()
+                .read()
+                .await
+                .get(&msg.author.id)
+                .map(|a| a.load(Ordering::Relaxed))
+                .unwrap_or(STARTING_POINTS);
             // Send the user the number of points they have left
             msg.author
                 .dm(&context, |m| {
                     m.content(format!(
                         "You have {} points left (out of {}) to spend in this election.",
-                        self.points
-                            .get(&g.id)
-                            .unwrap()
-                            .read()
-                            .unwrap()
-                            .get(&msg.author.id)
-                            .map(|a| a.load(Ordering::Relaxed))
-                            .unwrap_or(STARTING_POINTS),
-                        STARTING_POINTS,
+                        points_left, STARTING_POINTS,
                     ))
                 })
-                .await;
+                .await
+                .expect("discord API error");
         }
     }
 
@@ -366,7 +362,9 @@ impl Handler {
             self.stop(&context, msg).await;
 
             // Announce the vote
-            announce!(&context, msg, format!("@everyone An election has started: {}\nSuggest candidates with !prop <idea>\nTime remaining: {}h", msg.content, VOTE_INTERVAL));
+            if let Some(live_props) = announce!(&context, msg, format!("@everyone An election has started: {}\nSuggest candidates with !prop <idea>\n\nTime remaining: {}h\n**Suggestions so Far:**\nNo suggestions", args, VOTE_INTERVAL)) {
+                self.results.write().await.insert(g.id, live_props);
+            }
 
             // Stop the suggestion election after the voting interval
             // Count up the suggestions
@@ -379,6 +377,7 @@ impl Handler {
         }
     }
 
+    #[async_recursion]
     /// !stop: Stops the currently running step of the election
     async fn stop(&self, context: &Context, msg: &Message) {
         // Clear out the proposals and list them in an announcement
@@ -386,7 +385,7 @@ impl Handler {
             if let Some(g) = msg.guild(context).await {
                 role_gate!(&context, g, msg, "stop an election");
 
-                let all_candidates = self.upcoming_topics.get(&g.id).unwrap().read().unwrap();
+                let all_candidates = self.upcoming_topics.get(&g.id).unwrap().read().await;
 
                 // Buffer for the string representation of these candidates
                 let mut candidates_str = String::new();
@@ -397,7 +396,7 @@ impl Handler {
                         .get(&g.id)
                         .unwrap()
                         .write()
-                        .unwrap()
+                        .await
                         .insert(i, (name.clone(), AtomicUsize::new(0), HashMap::new()));
 
                     // Display the candidates with their indices
@@ -409,19 +408,19 @@ impl Handler {
                     .get(&g.id)
                     .unwrap()
                     .write()
-                    .unwrap()
+                    .await
                     .clear();
 
                 // Store the announcement message for later reporting
-                if let Some(live_results) = announce!(context, msg, format!("@everyone Candidates have been selected:\n{}\nVote with !vote <n votes>, <candidate number>\n**Results so Far**:\nNo votes cast!", candidates_str)) {
-                    self.results.write().unwrap().insert(g.id, live_results);
+                if let Some(live_results) = announce!(context, msg, format!("@everyone Candidates have been selected:\n{}\nVote with !vote <n votes>, <candidate number>\n**Results so Far:**\nNo votes cast!", candidates_str)) {
+                    self.results.write().await.insert(g.id, live_results);
                 }
 
                 // Allow user to cast votes, and then automatically stop the count after the
                 // interval
                 time::sleep(Duration::from_secs(VOTE_INTERVAL * 60 * 60)).await;
                 if self.in_vote_period(msg).await {
-                    self.stop(context, msg);
+                    self.stop(context, msg).await;
                 }
             }
         // Calculate the results of the election
@@ -440,10 +439,10 @@ impl Handler {
                 );
 
                 // Clear the votes
-                self.votes.get(&g.id).unwrap().write().unwrap().clear();
+                self.votes.get(&g.id).unwrap().write().await.clear();
 
                 // Reset point counts
-                for (user, points) in self.points.get(&g.id).unwrap().read().unwrap().iter() {
+                for (_user, points) in self.points.get(&g.id).unwrap().read().await.iter() {
                     points.swap(STARTING_POINTS, Ordering::Relaxed);
                 }
             }
@@ -459,7 +458,7 @@ impl Handler {
             .get(g)
             .unwrap()
             .read()
-            .unwrap()
+            .await
             .values()
             .map(|(c, votes, _)| (c.clone(), votes.load(Ordering::Relaxed)))
             .collect::<Vec<(String, usize)>>();
@@ -467,9 +466,45 @@ impl Handler {
         candidates
             .iter()
             .enumerate()
-            .map(|(i, w)| format!("#{} {}: {}\n", i, w.0, w.1))
+            .map(|(i, w)| format!("#{} {}: {}", i, w.0, w.1))
             .take(CONVENIENT_WINNERS)
             .collect::<Vec<String>>()
+    }
+
+    /// Updates the most recent announcement in the given guild with the latest suggestions.
+    async fn poll_suggestions(&self, context: &Context, g: &GuildId) {
+        let suggestions = self
+            .upcoming_topics
+            .get(g)
+            .unwrap()
+            .read()
+            .await
+            .iter()
+            .map(|s| format!("• {}", s))
+            .collect::<Vec<String>>();
+
+        let cts = self
+            .results
+            .read()
+            .await
+            .get(g)
+            .unwrap()
+            .content
+            .split_inclusive("**Suggestions so Far:**")
+            .map(|s| s.to_owned())
+            .next()
+            .unwrap_or_default();
+
+        self.results
+            .write()
+            .await
+            .get_mut(g)
+            .unwrap()
+            .edit(context, |m| {
+                m.content(format!("{}\n{}", cts, suggestions.join("\n")))
+            })
+            .await
+            .expect("discord API error");
     }
 
     /// Updates the most recent poll announcement in the given guild with the latest polling
@@ -477,7 +512,7 @@ impl Handler {
     async fn poll_votes(&self, context: Context, g: &GuildId) {
         let winners = self.winners(g).await.join("\n");
 
-        if !self.results.read().unwrap().contains_key(g) {
+        if !self.results.read().await.contains_key(g) {
             return;
         }
 
@@ -485,45 +520,48 @@ impl Handler {
         let cts = self
             .results
             .read()
-            .unwrap()
+            .await
             .get(g)
             .unwrap()
             .content
-            .split_inclusive("**Results so Far**:\n")
+            .split_inclusive("**Results so Far:**")
             .map(|s| s.to_owned())
             .next()
             .unwrap_or_default();
 
         self.results
             .write()
-            .unwrap()
+            .await
             .get_mut(g)
             .unwrap()
-            .edit(context, |m| m.content(format!("{}{}", cts, winners)))
-            .await;
+            .edit(context, |m| m.content(format!("{}\n{}", cts, winners)))
+            .await
+            .expect("discord API error");
     }
 
     /// Checks whether the vote is currently in the suggestion period.
     async fn in_suggestion_period(&self, msg: &Message) -> bool {
-        msg.guild_id
-            .map(|g| {
-                !self
-                    .upcoming_topics
-                    .get(&g)
-                    .unwrap()
-                    .read()
-                    .unwrap()
-                    .is_empty()
-            })
-            .unwrap_or_default()
+        if let Some(g) = msg.guild_id {
+            !self
+                .upcoming_topics
+                .get(&g)
+                .unwrap()
+                .read()
+                .await
+                .is_empty()
+        } else {
+            true
+        }
     }
 
     /// Checks whether the vote is currently in the suggestion period.
     /// If no votes are cast, it is not in the voting period.
     async fn in_vote_period(&self, msg: &Message) -> bool {
-        msg.guild_id
-            .map(|g| !self.votes.get(&g).unwrap().read().unwrap().is_empty())
-            .unwrap_or_default()
+        if let Some(g) = msg.guild_id {
+            !self.votes.get(&g).unwrap().read().await.is_empty()
+        } else {
+            true
+        }
     }
 }
 

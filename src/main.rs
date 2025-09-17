@@ -1,26 +1,23 @@
 #[macro_use]
 extern crate const_format;
 
-#[macro_use]
-extern crate async_recursion;
-
 use dotenv::dotenv;
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
-use serenity::model::{
-    channel::Message,
-    id::{GuildId, UserId},
+use serenity::all::{
+    GatewayIntents, Interaction, Message, GuildId, UserId, Ready,
+    CreateCommand, CreateCommandOption, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateInteractionResponseFollowup, EditMessage,
+    CommandOptionType, CommandInteraction,
 };
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::num::ParseIntError;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio::time;
 
 /// Where the discord api key should be stored in the process or .env environment
 /// variables
@@ -44,85 +41,113 @@ const SUGG_INTERVAL: u64 = 48;
 /// The number of hours that a vote should last
 const VOTE_INTERVAL: u64 = 24;
 
-/// The bot can be summoned through commands prefixed by:
-const BOT_PREFIX: &str = "!";
+/// The bot uses slash commands exclusively
 
-/// The name of the command used to add a proposal
-const PROP_CMD: &str = "prop";
+/// Environment variable name for approved servers list
+const APPROVED_SERVERS_KEY: &str = "APPROVED_SERVERS";
 
-/// The name of the command used to cast a vote
-const VOTE_CMD: &str = "vote";
-
-/// The name of the command used to check the user's balance
-const POINTS_CMD: &str = "points";
-
-/// The name of the command used to start a new voting process
-const START_CMD: &str = "start";
-
-/// The name of the command used to stop the current voting step
-const STOP_CMD: &str = "stop";
-
-/// The servers that the bot has been pre-approved for (whitelist only):
-/// - No Filter Podcast
-const APPROVED_SERVERS: [GuildId; 1] = [GuildId(936062001820622888)];
-
-// Make an announcement, granted that the user is a user with those privileges
+// Make an announcement in the bot channel with comprehensive error handling
 macro_rules! announce {
-    ($context:expr,$msg:ident,$cts:expr) => {
-        if let Some(ann_fut) = $msg.guild($context).await {
-            if let Some(ann) = ann_fut.channel_id_from_name($context, BOT_CHANNEL).await {
-                ann.say($context, $cts).await.ok()
-            } else {
-                None
-            }
-        } else {
-            $msg.author
-                .dm($context, |m| {
-                    m.content(format!("Failed to {}: guild could not be found!", $cts))
-                })
-                .await
-                .expect("discord API error");
+    ($context:expr,$guild_id:expr,$content:expr) => {{
+        async {
+            // Quick cache access with timeout protection
+            let channel_id = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                async {
+                    $context.cache.guild($guild_id)
+                        .and_then(|guild| guild.channels.iter().find(|(_, ch)| ch.name == BOT_CHANNEL).map(|(id, _)| *id))
+                }
+            ).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    eprintln!("Announcement channel '{}' not found in guild {}", BOT_CHANNEL, $guild_id);
+                    return None;
+                },
+                Err(_) => {
+                    eprintln!("Timeout accessing guild cache for announcement in {}", $guild_id);
+                    return None;
+                }
+            };
 
+            // Send message with timeout and retry logic
+            let mut attempts = 0;
+            const MAX_ATTEMPTS: u8 = 2;
+
+            while attempts < MAX_ATTEMPTS {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    channel_id.say($context, $content)
+                ).await {
+                    Ok(Ok(message)) => {
+                        println!("Successfully sent announcement to guild {}", $guild_id);
+                        return Some(message);
+                    },
+                    Ok(Err(e)) => {
+                        eprintln!("Discord API error in announce (attempt {}): {}", attempts + 1, e);
+                        if attempts + 1 >= MAX_ATTEMPTS {
+                            return None;
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!("Announce timeout (attempt {}) - Discord API took too long", attempts + 1);
+                        if attempts + 1 >= MAX_ATTEMPTS {
+                            return None;
+                        }
+                    }
+                }
+                attempts += 1;
+                // Brief delay before retry
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
             None
-        }
-    };
+        }.await
+    }};
 }
 
-// Prevents a user from performing this action
-macro_rules! role_gate {
-    ($context:expr,$guild:ident,$msg:ident,$action:expr) => {
-        // Ensure that the user executing the command has the BOT_ROLE
-        if let Some(role) = $guild.role_by_name(BOT_ROLE) {
-            if !$msg
-                .author
-                .has_role($context, $guild.id, role)
-                .await
-                .unwrap_or_default()
-            {
-                $msg.author
-                    .dm($context, |m| {
-                        m.content(format!(
-                            "You must have the {} role to {}!",
-                            BOT_ROLE, $action
-                        ))
-                    })
-                    .await
-                    .expect("discord API error");
-            }
+// Enhanced permission checking for admin commands
+macro_rules! check_admin_permission {
+    ($context:expr,$guild_id:expr,$user_id:expr) => {{
+        match $context.cache.guild($guild_id) {
+            Some(guild) => {
+                // Check if user is guild owner (always has permission)
+                if guild.owner_id == $user_id.id {
+                    true
+                } else if let Some(member) = guild.members.get(&$user_id.id) {
+                    // Check for Administrator permission
+                    if let Ok(permissions) = member.permissions($context) {
+                        if permissions.administrator() {
+                            true
+                        } else {
+                            // Check for the specific voting role
+                            guild.role_by_name(BOT_ROLE)
+                                .map(|role| member.roles.contains(&role.id))
+                                .unwrap_or(false)
+                        }
+                    } else {
+                        // Fallback to role check only
+                        guild.role_by_name(BOT_ROLE)
+                            .map(|role| member.roles.contains(&role.id))
+                            .unwrap_or(false)
+                    }
+                } else {
+                    false
+                }
+            },
+            None => false,
         }
-    };
+    }};
 }
 
-/// Possible commands for the quadratic voting bot:
-/// !prop <topic>: Adds a topic to the upcoming election
-/// !vote <n>, <topic>: Cast n votes for the selected topic
-/// !points: Get the sender's remaining points in the election
-/// !start <prompt>: Starts a new vote (can only be called by users with `vote` role)
-/// !stop: Stops the segment of the voting process (can only be called by users with `vote` role)
+/// Possible slash commands for the quadratic voting bot:
+/// /prop <topic>: Adds a topic to the upcoming election
+/// /vote <votes> <candidate_id>: Cast votes for the selected candidate
+/// /points: Get the sender's remaining points in the election
+/// /start <prompt>: Starts a new vote (can only be called by users with admin permissions)
+/// /stop: Stops the segment of the voting process (can only be called by users with admin permissions)
 #[derive(Default)]
 struct Handler {
     // Suggested topics for the upcoming election
-    upcoming_topics: HashMap<GuildId, Arc<RwLock<HashSet<String>>>>,
+    upcoming_topics: HashMap<GuildId, Arc<RwLock<Vec<String>>>>,
 
     // Users cannot have less than 0 points, but they may have different
     // balances per-guild
@@ -136,42 +161,107 @@ struct Handler {
         GuildId,
         Arc<RwLock<HashMap<usize, (String, AtomicUsize, HashMap<UserId, AtomicUsize>)>>>,
     >,
+
+    // Rate limiting: track last command usage per user per guild
+    last_command_time: Arc<RwLock<HashMap<(GuildId, UserId), Instant>>>,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn message(&self, context: Context, msg: Message) {
-        // Ignore all messages without the above prefix
-        if msg.content.len() == 0 || msg.content.get(..1) != Some(BOT_PREFIX) {
-            return;
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        println!("Bot logged in as {}", ready.user.name);
+
+        // Create modern slash commands with proper builders
+        let commands = vec![
+            CreateCommand::new("prop")
+                .description("Propose a candidate for the election")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "idea",
+                        "Your proposal"
+                    )
+                    .required(true)
+                ),
+            CreateCommand::new("vote")
+                .description("Cast votes for a candidate")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Integer,
+                        "n",
+                        "Votes to cast (1-10)"
+                    )
+                    .required(true)
+                    .min_int_value(1)
+                    .max_int_value(10)
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Integer,
+                        "id",
+                        "Candidate ID"
+                    )
+                    .required(true)
+                    .min_int_value(0)
+                ),
+            CreateCommand::new("points")
+                .description("Check your remaining voice credits"),
+            CreateCommand::new("start")
+                .description("Start a new election (requires voting role)")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "prompt",
+                        "Election topic/question"
+                    )
+                    .required(true)
+                ),
+            CreateCommand::new("stop")
+                .description("Stop the current election phase (requires voting role)"),
+        ];
+
+        // Register commands globally for all guilds
+        match ctx.http.create_global_commands(&commands).await {
+            Ok(_) => println!("Successfully registered {} global slash commands", commands.len()),
+            Err(why) => println!("Failed to register global commands: {:?}", why),
         }
+    }
 
-        // The first argument should be the name of the command
-        let (cmd, sargs) = msg.content[1..]
-            .split_once(' ')
-            .unwrap_or((&msg.content[1..], ""));
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        if let Interaction::Command(command) = interaction {
+            println!("Received slash command: {} from user: {}", command.data.name, command.user.id);
 
-        // Arguments must be manipulated later
-        let args = sargs.to_owned();
-
-        // See above explanation of different commands
-        match cmd {
-            PROP_CMD => self.prop(context, &msg, args).await,
-            VOTE_CMD => self.vote(context, &msg, args).await,
-            POINTS_CMD => self.points(context, &msg, args).await,
-            START_CMD => self.start(context, &msg, args).await,
-            STOP_CMD => self.stop(&context, &msg).await,
-            _ => (),
+            // Handle commands with appropriate response patterns
+            match command.data.name.as_str() {
+                "prop" => {
+                    self.handle_prop_command(&ctx, &command).await;
+                },
+                "vote" => {
+                    self.handle_vote_command(&ctx, &command).await;
+                },
+                "points" => {
+                    self.handle_points_command(&ctx, &command).await;
+                },
+                "start" => {
+                    self.handle_start_command(&ctx, &command).await;
+                },
+                "stop" => {
+                    self.handle_stop_command(&ctx, &command).await;
+                },
+                _ => {
+                    self.send_ephemeral_response(&ctx, &command, "❌ Unknown command. Please try again.").await;
+                },
+            }
         }
     }
 }
 
 impl Handler {
     /// Creates buckets for all of the pre-specified servers the bot belongs to.
-    fn register_servers(mut self) -> Self {
-        for g in APPROVED_SERVERS {
+    fn register_servers(mut self, approved_servers: Vec<GuildId>) -> Self {
+        for g in approved_servers {
             self.upcoming_topics
-                .insert(g, Arc::new(RwLock::new(HashSet::new())));
+                .insert(g, Arc::new(RwLock::new(Vec::new())));
             self.points.insert(g, Arc::new(RwLock::new(HashMap::new())));
             self.votes.insert(g, Arc::new(RwLock::new(HashMap::new())));
         }
@@ -179,275 +269,26 @@ impl Handler {
         self
     }
 
-    /// !prop <topic>: Adds a topic to the upcoming election
-    async fn prop(&self, context: Context, msg: &Message, args: String) {
-        // Users cannot propose while voting
-        if self.in_vote_period(msg).await {
-            msg.author
-                .dm(&context, |m| {
-                    m.content("Candidates cannot be proposed while the vote is ongoing!")
-                })
-                .await
-                .expect("discord API error");
+    /// Check if user is rate limited (max 1 command per 2 seconds)
+    async fn check_rate_limit(&self, guild_id: GuildId, user_id: UserId) -> bool {
+        let key = (guild_id, user_id);
+        let now = Instant::now();
+        let cooldown = Duration::from_secs(2);
 
-            return;
-        }
-
-        if let Some(g) = msg.guild(&context).await {
-            if self
-                .upcoming_topics
-                .get(&g.id)
-                .unwrap()
-                .read()
-                .await
-                .contains(args.as_str())
-            {
-                // Alert the user if their proposal already exists
-                msg.author
-                    .dm(&context, |m| {
-                        m.content(format!(
-                            "Your proposal {} already exists! Not adding.",
-                            args
-                        ))
-                    })
-                    .await
-                    .expect("discord API error");
+        let mut times = self.last_command_time.write().await;
+        if let Some(last_time) = times.get(&key) {
+            if now.duration_since(*last_time) < cooldown {
+                return true; // Rate limited
             }
-
-            // Register the new candidate
-            self.upcoming_topics
-                .get(&g.id)
-                .unwrap()
-                .write()
-                .await
-                .insert(args.trim_end().to_owned());
-            self.poll_suggestions(&context, &g.id).await;
-            announce!(&context, msg, format!("New candidate proposed: {}", args));
         }
+        times.insert(key, now);
+        false // Not rate limited
     }
 
-    /// !vote <n>, <topic>: Cast n votes for the selected topic
-    async fn vote(&self, context: Context, msg: &Message, args: String) {
-        // Extract the n and topic ID from the arguments
-        if let Ok(nargs) = args
-            .split(" ")
-            .map(|s| s.parse())
-            .collect::<Result<Vec<usize>, ParseIntError>>()
-        {
-            let (n, candidate_id) = (nargs[0], nargs[1]);
 
-            if let Some(guild) = msg.guild(&context).await {
-                let g = &guild.id;
 
-                // Reference to an atomic uint storing the user's vote count for the candidate
-                if let Some(candidate_votes) =
-                    self.votes.get(g).unwrap().read().await.get(&candidate_id)
-                {
-                    // Each user starts with STARTING_POINTS points
-                    if !self
-                        .points
-                        .get(g)
-                        .unwrap()
-                        .read()
-                        .await
-                        .contains_key(&msg.author.id)
-                    {
-                        self.points
-                            .get(g)
-                            .unwrap()
-                            .write()
-                            .await
-                            .insert(msg.author.id, AtomicUsize::new(STARTING_POINTS));
-                    }
 
-                    if let Some(existing_votes) = candidate_votes.2.get(&msg.author.id) {
-                        // The user will be refunded the points they've already spent on this candidate.
-                        // Calculate conversions from votes to points accordingly
-                        let can_spend = self
-                            .points
-                            .get(g)
-                            .unwrap()
-                            .read()
-                            .await
-                            .get(&msg.author.id)
-                            .unwrap()
-                            .load(Ordering::Relaxed)
-                            + existing_votes.load(Ordering::Relaxed).pow(2);
-                        let req_points = n.pow(2);
 
-                        // The user cannot continue if they lack the requisite points
-                        if can_spend < req_points {
-                            msg.author.dm(&context, |m| m.content(format!("Insufficient points to cast votes: {} votes cost {} points, but you can only spend {}.", n, req_points, can_spend))).await.expect("discord API error");
-
-                            return;
-                        }
-
-                        // Refund the user's votes previously delegated to the candidate
-                        let prev_votes = candidate_votes
-                            .2
-                            .get(&msg.author.id)
-                            .unwrap()
-                            .swap(n, Ordering::Relaxed);
-
-                        // Remove old votes for the candidate
-                        candidate_votes.1.fetch_sub(prev_votes, Ordering::Relaxed);
-
-                        // Refund the user's points
-                        self.points
-                            .get(g)
-                            .unwrap()
-                            .read()
-                            .await
-                            .get(&msg.author.id)
-                            .unwrap()
-                            .fetch_add(prev_votes, Ordering::Relaxed);
-                    }
-
-                    // Subtract the user's spent points and allocate the votes
-                    candidate_votes.1.fetch_add(n, Ordering::Relaxed);
-                    self.points
-                        .get(g)
-                        .unwrap()
-                        .read()
-                        .await
-                        .get(&msg.author.id)
-                        .unwrap()
-                        .fetch_sub(n, Ordering::Relaxed);
-
-                    // Recalculate the vote balance announcement
-                    self.poll_votes(context, g).await;
-                }
-            }
-        } else {
-            msg.author
-                .dm(&context, |m| {
-                    m.content("Missing parameters. Usage: ```\n!vote <n>, <topic id>\n```")
-                })
-                .await
-                .expect("discord API error");
-        }
-    }
-
-    /// !points: Get the sender's remaining points in the election
-    async fn points(&self, context: Context, msg: &Message, _args: String) {
-        if let Some(g) = msg.guild(&context).await {
-            let points_left = self
-                .points
-                .get(&g.id)
-                .unwrap()
-                .read()
-                .await
-                .get(&msg.author.id)
-                .map(|a| a.load(Ordering::Relaxed))
-                .unwrap_or(STARTING_POINTS);
-            // Send the user the number of points they have left
-            msg.author
-                .dm(&context, |m| {
-                    m.content(format!(
-                        "You have {} points left (out of {}) to spend in this election.",
-                        points_left, STARTING_POINTS,
-                    ))
-                })
-                .await
-                .expect("discord API error");
-        }
-    }
-
-    /// !start: Starts an election
-    async fn start(&self, context: Context, msg: &Message, args: String) {
-        if let Some(g) = msg.guild(&context).await {
-            role_gate!(&context, g, msg, "start an election");
-
-            // Stop any currently ongoing election
-            self.stop(&context, msg).await;
-
-            // Announce the vote
-            if let Some(live_props) = announce!(&context, msg, format!("@everyone An election has started: {}\nSuggest candidates with !prop <idea>\n\nTime remaining: {}h\n**Suggestions so Far:**\nNo suggestions", args, VOTE_INTERVAL)) {
-                self.results.write().await.insert(g.id, live_props);
-            }
-
-            // Stop the suggestion election after the voting interval
-            // Count up the suggestions
-            time::sleep(Duration::from_secs(SUGG_INTERVAL * 60 * 60)).await;
-
-            // If the user hasn't already cleared the suggestions, do it automatically
-            if self.in_suggestion_period(msg).await {
-                self.stop(&context, msg).await;
-            }
-        }
-    }
-
-    #[async_recursion]
-    /// !stop: Stops the currently running step of the election
-    async fn stop(&self, context: &Context, msg: &Message) {
-        // Clear out the proposals and list them in an announcement
-        if self.in_suggestion_period(msg).await {
-            if let Some(g) = msg.guild(context).await {
-                role_gate!(&context, g, msg, "stop an election");
-
-                let all_candidates = self.upcoming_topics.get(&g.id).unwrap().read().await;
-
-                // Buffer for the string representation of these candidates
-                let mut candidates_str = String::new();
-
-                // Clear out all candidates and set their vote counts to zero
-                for (i, name) in all_candidates.iter().enumerate() {
-                    self.votes
-                        .get(&g.id)
-                        .unwrap()
-                        .write()
-                        .await
-                        .insert(i, (name.clone(), AtomicUsize::new(0), HashMap::new()));
-
-                    // Display the candidates with their indices
-                    candidates_str = format!("{}#{}: {}\n", candidates_str, i, name);
-                }
-
-                // Remove all candidates
-                self.upcoming_topics
-                    .get(&g.id)
-                    .unwrap()
-                    .write()
-                    .await
-                    .clear();
-
-                // Store the announcement message for later reporting
-                if let Some(live_results) = announce!(context, msg, format!("@everyone Candidates have been selected:\n{}\nVote with !vote <n votes>, <candidate number>\n**Results so Far:**\nNo votes cast!", candidates_str)) {
-                    self.results.write().await.insert(g.id, live_results);
-                }
-
-                // Allow user to cast votes, and then automatically stop the count after the
-                // interval
-                time::sleep(Duration::from_secs(VOTE_INTERVAL * 60 * 60)).await;
-                if self.in_vote_period(msg).await {
-                    self.stop(context, msg).await;
-                }
-            }
-        // Calculate the results of the election
-        } else if self.in_vote_period(msg).await {
-            if let Some(g) = msg.guild(context).await {
-                let winners = self.winners(&g.id).await.join("\n");
-
-                // Display the first n winning candidates, their names, and their votes
-                announce!(
-                    context,
-                    msg,
-                    format!(
-                        "@everyone The election is over. The winners are:\n{}",
-                        winners,
-                    )
-                );
-
-                // Clear the votes
-                self.votes.get(&g.id).unwrap().write().await.clear();
-
-                // Reset point counts
-                for (_user, points) in self.points.get(&g.id).unwrap().read().await.iter() {
-                    points.swap(STARTING_POINTS, Ordering::Relaxed);
-                }
-            }
-        }
-    }
 
     /// Get a list of the candidates that are winning so far, sorted by their
     /// number of votes.
@@ -465,8 +306,7 @@ impl Handler {
         candidates.sort_by(|b, a| a.1.partial_cmp(&b.1).unwrap());
         candidates
             .iter()
-            .enumerate()
-            .map(|(i, w)| format!("#{} {}: {}", i, w.0, w.1))
+            .map(|w| format!("{}: {}", w.0, w.1))
             .take(CONVENIENT_WINNERS)
             .collect::<Vec<String>>()
     }
@@ -500,11 +340,64 @@ impl Handler {
             .await
             .get_mut(g)
             .unwrap()
-            .edit(context, |m| {
-                m.content(format!("{}\n{}", cts, suggestions.join("\n")))
-            })
+            .edit(context, EditMessage::new().content(format!("{}\n{}", cts, suggestions.join("\n"))))
             .await
             .expect("discord API error");
+    }
+
+    /// Safe version of poll_suggestions with proper error handling
+    async fn poll_suggestions_safe(&self, context: &Context, g: &GuildId) -> Result<(), String> {
+        let Some(topics_lock) = self.upcoming_topics.get(g) else {
+            return Err("Guild not found in topics".to_string());
+        };
+
+        // Quick check if there's an active election to update
+        {
+            let results_read = self.results.read().await;
+            if results_read.get(g).is_none() {
+                return Err("No active election to update".to_string());
+            }
+        }
+
+        let suggestions = topics_lock
+            .read()
+            .await
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("#{}: {}", i + 1, s))
+            .collect::<Vec<String>>();
+
+        let base_content = {
+            let results_read = self.results.read().await;
+            let Some(result_msg) = results_read.get(g) else {
+                return Err("No active announcement message".to_string());
+            };
+            let content_parts: Vec<&str> = result_msg.content.split("**Suggestions so Far:**").collect();
+            content_parts.get(0).unwrap_or(&"").to_string()
+        };
+
+        let mut results_write = self.results.write().await;
+        if let Some(message) = results_write.get_mut(g) {
+            let new_content = if suggestions.is_empty() {
+                format!("{}**Suggestions so Far:**\nNo suggestions yet", &base_content)
+            } else {
+                format!("{}**Suggestions so Far:**\n{}", &base_content, suggestions.join("\n"))
+            };
+
+            // Edit message with timeout protection
+            let edit_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                message.edit(context, EditMessage::new().content(new_content))
+            ).await;
+
+            match edit_result {
+                Ok(Ok(_)) => {}, // Success
+                Ok(Err(e)) => return Err(format!("Failed to edit message: {}", e)),
+                Err(_) => return Err("Timeout editing message".to_string()),
+            }
+        }
+
+        Ok(())
     }
 
     /// Updates the most recent poll announcement in the given guild with the latest polling
@@ -529,38 +422,573 @@ impl Handler {
             .next()
             .unwrap_or_default();
 
-        self.results
-            .write()
-            .await
-            .get_mut(g)
-            .unwrap()
-            .edit(context, |m| m.content(format!("{}\n{}", cts, winners)))
-            .await
-            .expect("discord API error");
-    }
+        // Acquire mutable access to the stored message, build the new content,
+        // and edit it with timeout + proper error handling.
+        let mut results_write = self.results.write().await;
+        if let Some(message) = results_write.get_mut(g) {
+            let new_content = format!("{}\n{}", cts, winners);
 
-    /// Checks whether the vote is currently in the suggestion period.
-    async fn in_suggestion_period(&self, msg: &Message) -> bool {
-        if let Some(g) = msg.guild_id {
-            !self
-                .upcoming_topics
-                .get(&g)
-                .unwrap()
-                .read()
-                .await
-                .is_empty()
-        } else {
-            true
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(8),
+                message.edit(&context, EditMessage::new().content(new_content))
+            ).await {
+                Ok(Ok(_)) => {
+                    println!("Successfully updated vote results for guild {}", g);
+                },
+                Ok(Err(e)) => {
+                    eprintln!("Discord API error updating vote results: {}", e);
+                },
+                Err(_) => {
+                    eprintln!("Timeout updating vote results for guild {}", g);
+                }
+            }
         }
     }
 
     /// Checks whether the vote is currently in the suggestion period.
+    async fn in_suggestion_period(&self, guild_id: &GuildId) -> bool {
+        !self
+            .upcoming_topics
+            .get(guild_id)
+            .unwrap()
+            .read()
+            .await
+            .is_empty()
+    }
+
+    /// Checks whether the vote is currently in the voting period.
     /// If no votes are cast, it is not in the voting period.
-    async fn in_vote_period(&self, msg: &Message) -> bool {
-        if let Some(g) = msg.guild_id {
-            !self.votes.get(&g).unwrap().read().await.is_empty()
+    async fn in_vote_period(&self, guild_id: &GuildId) -> bool {
+        !self.votes.get(guild_id).unwrap().read().await.is_empty()
+    }
+
+    // ===== INTERACTION RESPONSE HELPERS =====
+
+    /// Send an immediate response to the user
+    async fn send_response(&self, ctx: &Context, command: &CommandInteraction, content: &str) {
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new().content(content)
+        );
+
+        if let Err(why) = command.create_response(&ctx.http, response).await {
+            eprintln!("Failed to respond to command '{}': {}", command.data.name, why);
+        }
+    }
+
+    /// Send an ephemeral (private) response to the user
+    async fn send_ephemeral_response(&self, ctx: &Context, command: &CommandInteraction, content: &str) {
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(content)
+                .ephemeral(true)
+        );
+
+        if let Err(why) = command.create_response(&ctx.http, response).await {
+            eprintln!("Failed to send ephemeral response: {}", why);
+        }
+    }
+
+    /// Defer the response for long-running operations
+    async fn defer_response(&self, ctx: &Context, command: &CommandInteraction, ephemeral: bool) -> bool {
+        let response = if ephemeral {
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true))
         } else {
-            true
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new())
+        };
+
+        match command.create_response(&ctx.http, response).await {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("Failed to defer response: {}", why);
+                false
+            }
+        }
+    }
+
+    /// Send a follow-up message after deferring with timeout protection
+    async fn send_followup(&self, ctx: &Context, command: &CommandInteraction, content: &str) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            command.create_followup(ctx, CreateInteractionResponseFollowup::new().content(content))
+        ).await {
+            Ok(Ok(_)) => {
+                println!("Successfully sent follow-up response to user: {}", command.user.id);
+            },
+            Ok(Err(why)) => {
+                eprintln!("Discord API error in follow-up: {}", why);
+            },
+            Err(_) => {
+                eprintln!("Follow-up response timeout - Discord API took too long");
+            }
+        }
+    }
+
+    /// Send a follow-up message with guaranteed delivery (fallback to error message)
+    async fn send_followup_guaranteed(&self, ctx: &Context, command: &CommandInteraction, content: &str) {
+        let fallback_msg = "⚠️ Operation completed but response delivery failed. Please check the announcements channel.";
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            command.create_followup(ctx, CreateInteractionResponseFollowup::new().content(content))
+        ).await {
+            Ok(Ok(_)) => {
+                println!("Successfully sent follow-up response to user: {}", command.user.id);
+                return;
+            },
+            Ok(Err(why)) => {
+                eprintln!("Discord API error in follow-up, trying fallback: {}", why);
+            },
+            Err(_) => {
+                eprintln!("Follow-up response timeout, trying fallback message");
+            }
+        }
+
+        // Fallback attempt with error message
+        if let Err(why) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            command.create_followup(ctx, CreateInteractionResponseFollowup::new().content(fallback_msg))
+        ).await {
+            eprintln!("Critical: Failed to send any follow-up response: {:?}", why);
+        }
+    }
+
+    // ===== COMMAND HANDLERS WITH PROPER RESPONSE PATTERNS =====
+
+    async fn handle_prop_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let idea = match command.data.options.get(0)
+            .map(|opt| &opt.value)
+            .and_then(|val| val.as_str()) {
+            Some(idea) if !idea.trim().is_empty() => idea.trim().to_string(),
+            _ => {
+                self.send_ephemeral_response(ctx, command, "❌ Please provide a valid proposal idea!").await;
+                return;
+            },
+        };
+
+        // Defer response since announcing and state updates might take time
+        if !self.defer_response(ctx, command, false).await {
+            eprintln!("Failed to defer response for /prop command from user: {}", command.user.id);
+            return;
+        }
+
+        println!("Processing /prop command for user: {} with idea: {}", command.user.id, idea);
+
+        // Execute with timeout protection
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            self.slash_prop(ctx, command, idea.clone())
+        ).await {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("Timeout processing /prop command for user: {}", command.user.id);
+                format!("⏱️ Operation timed out, but your proposal '{}' may have been recorded. Please check the announcements channel.", idea)
+            }
+        };
+
+        self.send_followup_guaranteed(ctx, command, &result).await;
+        println!("Completed /prop command processing for user: {}", command.user.id);
+    }
+
+    async fn handle_vote_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let votes = command.data.options.get(0)
+            .map(|opt| &opt.value)
+            .and_then(|val| val.as_i64())
+            .filter(|&v| v > 0 && v <= 10)
+            .unwrap_or(0) as usize;
+
+        let candidate_id = command.data.options.get(1)
+            .map(|opt| &opt.value)
+            .and_then(|val| val.as_i64())
+            .filter(|&v| v >= 0)
+            .unwrap_or(-1) as isize;
+
+        if votes == 0 {
+            self.send_ephemeral_response(ctx, command, "❌ Number of votes must be between 1 and 10!").await;
+            return;
+        }
+
+        if candidate_id < 0 {
+            self.send_ephemeral_response(ctx, command, "❌ Please provide a valid candidate ID (0 or higher)!").await;
+            return;
+        }
+
+        let result = self.slash_vote(ctx, command, votes, candidate_id as usize).await;
+        self.send_response(ctx, command, &result).await;
+    }
+
+    async fn handle_points_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let result = self.slash_points(ctx, command).await;
+        self.send_ephemeral_response(ctx, command, &result).await; // Points are private
+    }
+
+    async fn handle_start_command(&self, ctx: &Context, command: &CommandInteraction) {
+        let prompt = match command.data.options.get(0)
+            .map(|opt| &opt.value)
+            .and_then(|val| val.as_str()) {
+            Some(prompt) if !prompt.trim().is_empty() => prompt.trim().to_string(),
+            _ => {
+                self.send_ephemeral_response(ctx, command, "❌ Please provide a valid election prompt!").await;
+                return;
+            },
+        };
+
+        // Defer response since starting an election might take time
+        if !self.defer_response(ctx, command, false).await {
+            eprintln!("Failed to defer response for /start command from user: {}", command.user.id);
+            return;
+        }
+
+        println!("Processing /start command for user: {} with prompt: {}", command.user.id, prompt);
+
+        // Execute with timeout protection - start command can be complex
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.slash_start(ctx, command, prompt.clone())
+        ).await {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("Timeout processing /start command for user: {}", command.user.id);
+                format!("⏱️ Election start operation timed out. Please check the announcements channel and try again if needed.")
+            }
+        };
+
+        self.send_followup_guaranteed(ctx, command, &result).await;
+        println!("Completed /start command processing for user: {}", command.user.id);
+    }
+
+    async fn handle_stop_command(&self, ctx: &Context, command: &CommandInteraction) {
+        // Defer response since stopping might take time to calculate results
+        if !self.defer_response(ctx, command, false).await {
+            eprintln!("Failed to defer response for /stop command from user: {}", command.user.id);
+            return;
+        }
+
+        println!("Processing /stop command for user: {}", command.user.id);
+
+        // Execute with timeout protection
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.slash_stop(ctx, command)
+        ).await {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("Timeout processing /stop command for user: {}", command.user.id);
+                "⏱️ Election stop operation timed out. Please check the announcements channel for status.".to_string()
+            }
+        };
+
+        self.send_followup_guaranteed(ctx, command, &result).await;
+        println!("Completed /stop command processing for user: {}", command.user.id);
+    }
+
+    // ===== SLASH COMMAND HANDLERS =====
+
+    async fn slash_prop(&self, ctx: &Context, command: &CommandInteraction, idea: String) -> String {
+        let Some(guild_id) = command.guild_id else {
+            return "❌ This command can only be used in a server!".to_string();
+        };
+
+        // Check rate limiting
+        if self.check_rate_limit(guild_id, command.user.id).await {
+            return "⏱️ Please wait 2 seconds between commands!".to_string();
+        }
+
+        // Check if the idea is too long
+        if idea.len() > 100 {
+            return "❌ Proposal ideas must be 100 characters or less!".to_string();
+        }
+
+        // Check if in voting period
+        if self.in_vote_period(&guild_id).await {
+            return "❌ Candidates cannot be proposed while the vote is ongoing!".to_string();
+        }
+
+        // Safe access to guild data
+        let Some(topics_lock) = self.upcoming_topics.get(&guild_id) else {
+            return "❌ Server not configured for voting. Contact an administrator.".to_string();
+        };
+
+        // Check for duplicates with proper error handling - scope the read lock
+        let is_duplicate = {
+            topics_lock.read().await.contains(&idea)
+        };
+
+        match is_duplicate {
+            true => format!("❌ Your proposal '{}' already exists!", idea),
+            false => {
+                // Add the proposal with error handling
+                println!("Attempting to store proposal '{}' for guild {}", idea, guild_id);
+                topics_lock.write().await.push(idea.clone());
+                println!("Successfully stored proposal '{}' for guild {}", idea, guild_id);
+
+                // Update suggestions display (only if election is active)
+                if let Err(e) = self.poll_suggestions_safe(ctx, &guild_id).await {
+                    // Silent fail if no active election - this is normal for first proposals
+                    eprintln!("No active election to update: {}", e);
+                }
+
+                // Announce in channel (non-blocking)
+                if let Some(_) = announce!(ctx, guild_id, format!("🗳️ New candidate proposed: {}", idea)) {
+                    // Announcement successful
+                } else {
+                    eprintln!("Failed to announce new proposal in guild {} - channel not found or no permissions", guild_id);
+                }
+
+                format!("✅ Proposal '{}' added successfully!", idea)
+            }
+        }
+    }
+
+    async fn slash_vote(&self, ctx: &Context, command: &CommandInteraction, votes: usize, candidate_id: usize) -> String {
+        let Some(guild_id) = command.guild_id else {
+            return "❌ This command can only be used in a server!".to_string();
+        };
+
+        // Check rate limiting
+        if self.check_rate_limit(guild_id, command.user.id).await {
+            return "⏱️ Please wait 2 seconds between commands!".to_string();
+        }
+
+        // Validate vote count
+        if votes == 0 || votes > 10 {
+            return "❌ Number of votes must be between 1 and 10!".to_string();
+        }
+
+        // Safe access to guild data
+        let Some(votes_lock) = self.votes.get(&guild_id) else {
+            return "❌ Server not configured for voting. Contact an administrator.".to_string();
+        };
+
+        let Some(points_lock) = self.points.get(&guild_id) else {
+            return "❌ Server not configured for voting. Contact an administrator.".to_string();
+        };
+
+        // Convert user's 1-based candidate ID to 0-based internal index
+        if candidate_id == 0 {
+            return "❌ Candidate IDs start from 1. Use `/vote <votes> <candidate_id>` where candidate_id ≥ 1".to_string();
+        }
+        let internal_candidate_id = candidate_id - 1;
+
+        // Check if candidate exists
+        let votes_read = votes_lock.read().await;
+        if !votes_read.contains_key(&internal_candidate_id) {
+            return format!("❌ Candidate #{} does not exist!", candidate_id);
+        }
+        drop(votes_read);
+
+        // Initialize user points if needed
+        if !points_lock.read().await.contains_key(&command.user.id) {
+            points_lock.write().await.insert(command.user.id, AtomicUsize::new(STARTING_POINTS));
+        }
+
+        let req_points = votes.pow(2);
+        let mut can_spend = points_lock.read().await
+            .get(&command.user.id).unwrap().load(Ordering::Relaxed);
+
+        // Check for existing votes and calculate refund
+        let votes_read = votes_lock.read().await;
+        if let Some(candidate) = votes_read.get(&internal_candidate_id) {
+            if let Some(existing_votes) = candidate.2.get(&command.user.id) {
+                can_spend += existing_votes.load(Ordering::Relaxed).pow(2);
+            }
+        }
+        drop(votes_read);
+
+        if can_spend < req_points {
+            return format!("❌ Insufficient points! {} votes cost {} points, but you can only spend {}.",
+                votes, req_points, can_spend);
+        }
+
+        // Process the vote with proper error handling
+        let mut votes_map = votes_lock.write().await;
+        if let Some(candidate_entry) = votes_map.get_mut(&internal_candidate_id) {
+            // Handle existing votes refund
+            if let Some(existing_votes) = candidate_entry.2.get(&command.user.id) {
+                let prev_votes = existing_votes.swap(votes, Ordering::Relaxed);
+                candidate_entry.1.fetch_sub(prev_votes, Ordering::Relaxed);
+                points_lock.read().await.get(&command.user.id).unwrap()
+                    .fetch_add(prev_votes.pow(2), Ordering::Relaxed);
+            } else {
+                candidate_entry.2.insert(command.user.id, AtomicUsize::new(votes));
+            }
+
+            // Add new votes and charge points
+            candidate_entry.1.fetch_add(votes, Ordering::Relaxed);
+            points_lock.read().await.get(&command.user.id).unwrap()
+                .fetch_sub(req_points, Ordering::Relaxed);
+        } else {
+            return format!("❌ Candidate #{} no longer exists!", candidate_id);
+        }
+        drop(votes_map);
+
+        // Update results (non-blocking)
+        self.poll_votes(ctx.clone(), &guild_id).await;
+
+        let remaining = points_lock.read().await
+            .get(&command.user.id).unwrap().load(Ordering::Relaxed);
+
+        format!("✅ Cast {} votes for candidate #{}! Points remaining: {}", votes, candidate_id, remaining)
+    }
+
+    async fn slash_points(&self, _ctx: &Context, command: &CommandInteraction) -> String {
+        let Some(guild_id) = command.guild_id else {
+            return "❌ This command can only be used in a server!".to_string();
+        };
+
+        // Safe access to guild data
+        let Some(points_lock) = self.points.get(&guild_id) else {
+            return "❌ Server not configured for voting. Contact an administrator.".to_string();
+        };
+
+        let points_left = points_lock.read().await
+            .get(&command.user.id)
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(STARTING_POINTS);
+
+        format!("🗳️ You have **{}** points left (out of {}) to spend in this election.",
+            points_left, STARTING_POINTS)
+    }
+
+    async fn slash_start(&self, ctx: &Context, command: &CommandInteraction, prompt: String) -> String {
+        let Some(guild_id) = command.guild_id else {
+            return "❌ This command can only be used in a server!".to_string();
+        };
+
+        // Check if guild exists in cache
+        if ctx.cache.guild(guild_id).is_none() {
+            return "❌ Unable to access server information. Please try again.".to_string();
+        };
+
+        // Check admin permissions with timeout protection
+        let has_permission = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            async { check_admin_permission!(ctx, guild_id, command.user) }
+        ).await.unwrap_or(false);
+
+        if !has_permission {
+            return format!(
+                "❌ You need one of the following to start an election:\n• Server Owner\n• Administrator permission\n• '{}' role",
+                BOT_ROLE
+            );
+        }
+
+        println!("User {} has permission to start election in guild {}", command.user.id, guild_id);
+
+        // Stop any ongoing election first with timeout protection
+        let stop_result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.slash_stop_internal(ctx, guild_id)
+        ).await;
+
+        if stop_result.is_err() {
+            eprintln!("Timeout stopping previous election in guild {}", guild_id);
+        }
+
+        // Find announcement channel with error handling
+        let channel_id = ctx.cache.guild(guild_id)
+            .and_then(|guild| guild.channels.iter().find(|(_, ch)| ch.name == BOT_CHANNEL).map(|(id, _)| *id));
+
+        let Some(channel_id) = channel_id else {
+            return format!("❌ Announcement channel '{}' not found. Please create it first.", BOT_CHANNEL);
+        };
+
+        // Create election announcement with timeout protection
+        let announcement_content = format!(
+            "@everyone 🗳️ **An election has started:** {}\n\nSuggest candidates with `/prop <idea>`\n\n⏰ Time remaining: {}h\n\n**Suggestions so Far:**\nNo suggestions yet",
+            prompt, SUGG_INTERVAL
+        );
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            channel_id.say(ctx, announcement_content)
+        ).await {
+            Ok(Ok(message)) => {
+                self.results.write().await.insert(guild_id, message);
+                println!("Successfully created election announcement in guild {}", guild_id);
+                format!("✅ Election started: '{}'", prompt)
+            },
+            Ok(Err(why)) => {
+                eprintln!("Failed to create election announcement: {}", why);
+                format!("⚠️ Election started but failed to post announcement: '{}'. Please check channel permissions.", prompt)
+            },
+            Err(_) => {
+                eprintln!("Timeout creating election announcement in guild {}", guild_id);
+                format!("⚠️ Election started but announcement timed out: '{}'. Please check the announcements channel.", prompt)
+            }
+        }
+    }
+
+    async fn slash_stop(&self, ctx: &Context, command: &CommandInteraction) -> String {
+        if let Some(guild_id) = command.guild_id {
+            if let Some(_guild) = ctx.cache.guild(guild_id) {
+                // Check admin permissions (role, administrator, or owner)
+                if !check_admin_permission!(ctx, guild_id, command.user) {
+                    return format!(
+                        "❌ You need one of the following to stop an election:\n• Server Owner\n• Administrator permission\n• '{}' role",
+                        BOT_ROLE
+                    );
+                }
+            }
+
+            self.slash_stop_internal(ctx, guild_id).await
+        } else {
+            "❌ This command can only be used in a server!".to_string()
+        }
+    }
+
+    async fn slash_stop_internal(&self, ctx: &Context, guild_id: GuildId) -> String {
+        // Check if in suggestion period
+        if !self.upcoming_topics.get(&guild_id).unwrap().read().await.is_empty() {
+            // Move from suggestions to voting
+            let all_candidates: Vec<String> = self.upcoming_topics.get(&guild_id).unwrap().read().await.iter().cloned().collect();
+            
+            let mut candidates_str = String::new();
+            for (i, name) in all_candidates.iter().enumerate() {
+                self.votes.get(&guild_id).unwrap().write().await
+                    .insert(i, (name.clone(), AtomicUsize::new(0), HashMap::new()));
+                candidates_str = format!("{}#{}: {}\n", candidates_str, i + 1, name);
+            }
+
+            // Clear suggestions
+            self.upcoming_topics.get(&guild_id).unwrap().write().await.clear();
+
+            // Post voting message
+            let channel_id = ctx.cache.guild(guild_id)
+                .and_then(|guild| guild.channels.iter().find(|(_, ch)| ch.name == BOT_CHANNEL).map(|(id, _)| *id));
+
+            if let Some(channel_id) = channel_id {
+                if let Ok(message) = channel_id.say(ctx, format!(
+                    "@everyone 🗳️ **Candidates selected:**\n{}\nVote with `/vote <votes> <candidate_number>`\n\n**Results so Far:**\nNo votes cast yet!",
+                    candidates_str
+                )).await {
+                    self.results.write().await.insert(guild_id, message);
+                }
+            }
+
+            "✅ Moved to voting phase!".to_string()
+        } else if !self.votes.get(&guild_id).unwrap().read().await.is_empty() {
+            // End voting and show results
+            let winners = self.winners(&guild_id).await.join("\n");
+            
+            let channel_id = ctx.cache.guild(guild_id)
+                .and_then(|guild| guild.channels.iter().find(|(_, ch)| ch.name == BOT_CHANNEL).map(|(id, _)| *id));
+
+            if let Some(channel_id) = channel_id {
+                let _ = channel_id.say(ctx, format!(
+                    "@everyone 🏆 **The election is over!**\n\n**Winners:**\n{}",
+                    winners
+                )).await;
+            }
+
+            // Reset state
+            self.votes.get(&guild_id).unwrap().write().await.clear();
+            for (_user, points) in self.points.get(&guild_id).unwrap().read().await.iter() {
+                points.swap(STARTING_POINTS, Ordering::Relaxed);
+            }
+
+            "✅ Election completed and results announced!".to_string()
+        } else {
+            "❌ No active election to stop!".to_string()
         }
     }
 }
@@ -574,10 +1002,28 @@ async fn main() {
     let token =
         env::var(SECRET_KEY).expect(formatcp!("missing discord API secret in {}", SECRET_KEY));
 
-    let handler = <Handler as Default>::default().register_servers();
+    // Parse approved servers from environment variable
+    let approved_servers_str = env::var(APPROVED_SERVERS_KEY)
+        .expect(formatcp!("missing {} in environment variables", APPROVED_SERVERS_KEY));
+    
+    let approved_servers: Vec<GuildId> = approved_servers_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| GuildId::new(s.parse::<u64>().expect(&format!("Invalid server ID: {}", s))))
+        .collect();
+
+    println!("Bot configured for {} server(s): {:?}", approved_servers.len(), approved_servers);
+
+    let handler = <Handler as Default>::default().register_servers(approved_servers);
+
+    // Set gateway intents for slash commands and guild operations
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MEMBERS
+        | GatewayIntents::GUILD_MESSAGES;
 
     // Run the bot
-    Client::builder(token)
+    Client::builder(token, intents)
         .event_handler(handler)
         .await
         .expect("failed to create client")

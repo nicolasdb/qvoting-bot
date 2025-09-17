@@ -1,0 +1,27 @@
+# Don't copy these files into Docker build context
+target/
+Dockerfile*
+docker-compose*
+.dockerignore
+.git
+.gitignore
+*.md
+.env
+logs/
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files  
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

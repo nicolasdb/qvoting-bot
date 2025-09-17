@@ -1,0 +1,33 @@
+services:
+  qvoting-bot:
+    build: .
+    container_name: qvoting-bot
+    restart: unless-stopped
+    environment:
+      # Discord bot token - set this in your .env file
+      - DISCORD_SECRET=${DISCORD_SECRET}
+    env_file:
+      - .env
+    # Optional: Mount for logs (if we add logging later)
+    volumes:
+      - ./logs:/app/logs
+    # Health check to ensure bot stays running
+    healthcheck:
+      test: ["CMD", "pgrep", "qvoting-bot"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# Optional: If we want to add a database later
+#  database:
+#    image: postgres:15
+#    container_name: qvoting-db
+#    environment:
+#      POSTGRES_DB: qvoting
+#      POSTGRES_USER: qvoting
+#      POSTGRES_PASSWORD: ${DB_PASSWORD}
+#    volumes:
+#      - postgres_data:/var/lib/postgresql/data
+
+#volumes:
+#  postgres_data:

@@ -119,8 +119,8 @@ Ready to set up your own quadratic voting bot? Check out our [**📋 Setup Guide
 
 - [ ] Persistent database storage
 - [ ] Web dashboard for results visualization  
-- [ ] Multiple concurrent elections #3
-- [ ] Configurable time intervals #2
+- [ ] Multiple concurrent elections [#3](https://github.com/nicolasdb/qvoting-bot/issues/3)
+- [ ] Configurable time intervals [#2](https://github.com/nicolasdb/qvoting-bot/issues/2)
 - [ ] Audit logs and vote history
 
 ---
